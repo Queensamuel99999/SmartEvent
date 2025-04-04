@@ -294,3 +294,272 @@
   (default-to { attendees: (list) } (map-get? attendance { event-id: event-id }))
 )
 
+(define-map event-categories
+  { event-id: uint }
+  {
+    category: (string-ascii 50),
+    tags: (list 10 (string-ascii 20))
+  }
+)
+
+;; Add these public functions
+(define-public (set-event-category 
+    (event-id uint) 
+    (category (string-ascii 50))
+    (event-tags (list 10 (string-ascii 20))))
+  (let ((event (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get organizer event)) ERR-NOT-AUTHORIZED)
+    (map-set event-categories
+      { event-id: event-id }
+      {
+        category: category,
+        tags: event-tags
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-event-category (event-id uint))
+  (map-get? event-categories { event-id: event-id })
+)
+
+
+;; Add to Data maps section
+(define-map event-ratings
+  { event-id: uint, user: principal }
+  {
+    rating: uint,
+    review: (string-ascii 200)
+  }
+)
+
+(define-map event-average-rating
+  { event-id: uint }
+  {
+    total-ratings: uint,
+    average-rating: uint
+  }
+)
+
+;; Add these public functions
+(define-public (rate-event 
+    (event-id uint) 
+    (rating uint) 
+    (review (string-ascii 200)))
+  (let (
+    (event (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND))
+    (current-avg (default-to { total-ratings: u0, average-rating: u0 } 
+                  (map-get? event-average-rating { event-id: event-id })))
+  )
+    (asserts! (>= rating u1) (err u300))
+    (asserts! (<= rating u5) (err u301))
+    (asserts! (get ended event) (err u302))
+    
+    (map-set event-ratings
+      { event-id: event-id, user: tx-sender }
+      { rating: rating, review: review }
+    )
+    
+    (map-set event-average-rating
+      { event-id: event-id }
+      {
+        total-ratings: (+ (get total-ratings current-avg) u1),
+        average-rating: (/ (+ (* (get average-rating current-avg) 
+                                (get total-ratings current-avg)) 
+                             rating)
+                          (+ (get total-ratings current-avg) u1))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-event-rating (event-id uint))
+  (map-get? event-average-rating { event-id: event-id })
+)
+
+
+;; Add to events map
+(define-constant ERR-REFUND-NOT-ALLOWED (err u108))
+
+(define-map refund-policies
+  { event-id: uint }
+  {
+    refundable: bool,
+    refund-deadline: uint,
+    refund-percentage: uint
+  }
+)
+
+(define-public (set-refund-policy
+    (event-id uint)
+    (refundable bool)
+    (refund-deadline uint)
+    (refund-percentage uint))
+  (let ((event (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get organizer event)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= refund-percentage u100) (err u109))
+    
+    (map-set refund-policies
+      { event-id: event-id }
+      {
+        refundable: refundable,
+        refund-deadline: refund-deadline,
+        refund-percentage: refund-percentage
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (request-refund (event-id uint) (ticket-id uint))
+  (let (
+    (event (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND))
+    (ticket (unwrap! (map-get? tickets { event-id: event-id, ticket-id: ticket-id }) ERR-TICKET-NOT-FOUND))
+    (policy (unwrap! (map-get? refund-policies { event-id: event-id }) ERR-REFUND-NOT-ALLOWED))
+  )
+    (asserts! (get refundable policy) ERR-REFUND-NOT-ALLOWED)
+    (asserts! (< stacks-block-height (get refund-deadline policy)) ERR-REFUND-NOT-ALLOWED)
+    (asserts! (is-eq tx-sender (get owner ticket)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get used ticket)) ERR-TICKET-ALREADY-USED)
+    
+    ;; Process refund logic here
+    (map-set tickets
+      { event-id: event-id, ticket-id: ticket-id }
+      (merge ticket { owner: (get organizer event), used: true })
+    )
+    (ok true)
+  )
+)
+
+;; Add to Data maps section
+(define-map event-waitlist
+  { event-id: uint }
+  {
+    users: (list 100 principal),
+    notification-sent: (list 100 bool)
+  }
+)
+
+(define-public (join-waitlist (event-id uint))
+  (let (
+    (event (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND))
+    (current-waitlist (default-to { users: (list), notification-sent: (list) } 
+                       (map-get? event-waitlist { event-id: event-id })))
+  )
+    (asserts! (not (get ended event)) ERR-EVENT-ENDED)
+    
+    (map-set event-waitlist
+      { event-id: event-id }
+      {
+        users: (unwrap! (as-max-len? 
+                         (append (get users current-waitlist) tx-sender) 
+                         u100) 
+                       (err u110)),
+        notification-sent: (unwrap! (as-max-len? 
+                                    (append (get notification-sent current-waitlist) false)
+                                    u100)
+                                  (err u110))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-waitlist-position (event-id uint))
+  (let ((waitlist (default-to { users: (list), notification-sent: (list) }
+                   (map-get? event-waitlist { event-id: event-id }))))
+    (index-of (get users waitlist) tx-sender)
+  )
+)
+
+
+;; Add to tickets map
+(define-map ticket-qr-data
+  { event-id: uint, ticket-id: uint }
+  {
+    code: (string-ascii 100),
+    generated-at: uint,
+    valid-until: uint
+  }
+)
+
+(define-public (generate-ticket-qr (event-id uint) (ticket-id uint))
+  (let (
+    (ticket (unwrap! (map-get? tickets { event-id: event-id, ticket-id: ticket-id }) ERR-TICKET-NOT-FOUND))
+    (current-time stacks-block-height)
+  )
+    (asserts! (is-eq tx-sender (get owner ticket)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get used ticket)) ERR-TICKET-ALREADY-USED)
+    
+    (let ((qr-string (concat (concat (int-to-ascii event-id) "-") (int-to-ascii ticket-id))))
+      (map-set ticket-qr-data
+        { event-id: event-id, ticket-id: ticket-id }
+        {
+          code: qr-string,
+          generated-at: current-time,
+          valid-until: (+ current-time u1440) ;; Valid for 1440 blocks (approx. 24 hours)
+        }
+      )
+      (ok qr-string)
+    )
+  )
+)
+
+(define-read-only (verify-ticket-qr 
+    (event-id uint) 
+    (ticket-id uint) 
+    (qr-code (string-ascii 100)))
+  (let ((qr-data (unwrap! (map-get? ticket-qr-data { event-id: event-id, ticket-id: ticket-id }) 
+                          (err u111))))
+    (ok (and
+      (is-eq (get code qr-data) qr-code)
+      (< stacks-block-height (get valid-until qr-data))
+    ))
+  )
+)
+
+;; Add to Data maps section
+(define-map promo-codes
+  { event-id: uint, code: (string-ascii 20) }
+  {
+    discount-percentage: uint,
+    max-uses: uint,
+    uses: uint,
+    expires-at: uint
+  }
+)
+
+(define-public (create-promo-code
+    (event-id uint)
+    (code (string-ascii 20))
+    (discount-percentage uint)
+    (max-uses uint)
+    (expires-at uint))
+  (let ((event (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get organizer event)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= discount-percentage u100) (err u112))
+    
+    (map-set promo-codes
+      { event-id: event-id, code: code }
+      {
+        discount-percentage: discount-percentage,
+        max-uses: max-uses,
+        uses: u0,
+        expires-at: expires-at
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (verify-promo-code (event-id uint) (code (string-ascii 20)))
+  (let ((promo (unwrap! (map-get? promo-codes { event-id: event-id, code: code }) 
+                        (err u113))))
+    (ok (and
+      (< stacks-block-height (get expires-at promo))
+      (< (get uses promo) (get max-uses promo))
+    ))
+  )
+)
