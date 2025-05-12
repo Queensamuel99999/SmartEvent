@@ -563,3 +563,157 @@
     ))
   )
 )
+
+
+(define-map vip-passes
+  { pass-id: uint }
+  {
+    name: (string-ascii 50),
+    owner: principal,
+    valid-until: uint,
+    events: (list 50 uint),
+    benefits: (string-ascii 200),
+    transferable: bool
+  }
+)
+
+(define-data-var last-pass-id uint u0)
+
+(define-public (create-vip-pass 
+    (name (string-ascii 50))
+    (valid-until uint)
+    (event-list (list 50 uint))
+    (benefits (string-ascii 200))
+    (transferable bool))
+  (let ((pass-id (+ (var-get last-pass-id) u1)))
+    (map-set vip-passes
+      { pass-id: pass-id }
+      {
+        name: name,
+        owner: tx-sender,
+        valid-until: valid-until,
+        events: event-list,
+        benefits: benefits,
+        transferable: transferable
+      }
+    )
+    (var-set last-pass-id pass-id)
+    (ok pass-id)
+  )
+)
+
+(define-public (transfer-vip-pass (pass-id uint) (new-owner principal))
+  (let ((pass (unwrap! (map-get? vip-passes { pass-id: pass-id }) (err u114))))
+    (asserts! (is-eq tx-sender (get owner pass)) ERR-NOT-AUTHORIZED)
+    (asserts! (get transferable pass) ERR-NOT-AUTHORIZED)
+    (map-set vip-passes
+      { pass-id: pass-id }
+      (merge pass { owner: new-owner })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-vip-pass (pass-id uint))
+  (map-get? vip-passes { pass-id: pass-id })
+)
+
+
+(define-read-only (get-vip-pass-events (pass-id uint))
+  (let ((pass (unwrap! (map-get? vip-passes { pass-id: pass-id }) (err u115))))
+    (ok (get events pass))
+  )
+)
+(define-read-only (get-vip-pass-benefits (pass-id uint))
+  (let ((pass (unwrap! (map-get? vip-passes { pass-id: pass-id }) (err u116))))
+    (ok (get benefits pass))
+  )
+)
+(define-read-only (get-vip-pass-validity (pass-id uint))
+  (let ((pass (unwrap! (map-get? vip-passes { pass-id: pass-id }) (err u117))))
+    (ok (< stacks-block-height (get valid-until pass)))
+  )
+)
+(define-read-only (get-vip-pass-owner (pass-id uint))
+  (let ((pass (unwrap! (map-get? vip-passes { pass-id: pass-id }) (err u118))))
+    (ok (get owner pass))
+  )
+)
+(define-read-only (get-vip-pass-transferable (pass-id uint))
+  (let ((pass (unwrap! (map-get? vip-passes { pass-id: pass-id }) (err u119))))
+    (ok (get transferable pass))
+  )
+)
+
+
+(define-map dynamic-pricing
+  { event-id: uint, tier-id: uint }
+  {
+    base-price: uint,
+    max-price: uint,
+    min-price: uint,
+    current-price: uint,
+    last-update: uint,
+    demand-multiplier: uint
+  }
+)
+
+(define-public (setup-dynamic-pricing
+    (event-id uint)
+    (tier-id uint)
+    (base-price uint)
+    (max-price uint)
+    (min-price uint))
+  (let ((event (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get organizer event)) ERR-NOT-AUTHORIZED)
+    (map-set dynamic-pricing
+      { event-id: event-id, tier-id: tier-id }
+      {
+        base-price: base-price,
+        max-price: max-price,
+        min-price: min-price,
+        current-price: base-price,
+        last-update: stacks-block-height,
+        demand-multiplier: u100
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-dynamic-price (event-id uint) (tier-id uint))
+  (let (
+    (pricing (unwrap! (map-get? dynamic-pricing { event-id: event-id, tier-id: tier-id }) (err u117)))
+    (tier (unwrap! (map-get? ticket-tiers { event-id: event-id, tier-id: tier-id }) (err u117)))
+  )
+    (let ((new-price (calculate-dynamic-price 
+                      (get base-price pricing)
+                      (get max-price pricing)
+                      (get min-price pricing)
+                      (get sold tier)
+                      (get max-supply tier))))
+      (map-set dynamic-pricing
+        { event-id: event-id, tier-id: tier-id }
+        (merge pricing {
+          current-price: new-price,
+          last-update: stacks-block-height
+        })
+      )
+      (ok new-price)
+    )
+  )
+)
+
+(define-private (calculate-dynamic-price (base uint) (max uint) (min uint) (sold uint) (total uint))
+  (let ((demand-factor (/ (* sold u100) total)))
+    (let ((price-adjustment (* base (/ demand-factor u100))))
+      (if (> price-adjustment max)
+        max
+        (if (< price-adjustment min)
+          min
+          price-adjustment
+        )
+      )
+    )
+  )
+)
