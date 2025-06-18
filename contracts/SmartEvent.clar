@@ -15,6 +15,52 @@
 (define-constant ERR-EVENT-ENDED (err u106))
 (define-constant ERR-SOLD-OUT (err u107))
 
+(define-constant ERR-ANALYTICS-NOT-FOUND (err u120))
+(define-constant ERR-INSUFFICIENT-DATA (err u121))
+
+(define-map event-analytics
+  { event-id: uint }
+  {
+    total-revenue: uint,
+    peak-sales-day: uint,
+    peak-sales-count: uint,
+    first-sale-time: uint,
+    last-sale-time: uint,
+    average-sale-price: uint,
+    conversion-rate: uint,
+    views: uint
+  }
+)
+
+(define-map daily-sales
+  { event-id: uint, day: uint }
+  {
+    tickets-sold: uint,
+    revenue: uint,
+    unique-buyers: uint
+  }
+)
+
+(define-map tier-performance
+  { event-id: uint, tier-id: uint }
+  {
+    conversion-rate: uint,
+    average-time-to-sell: uint,
+    revenue: uint,
+    refund-rate: uint
+  }
+)
+
+(define-map buyer-analytics
+  { event-id: uint, buyer: principal }
+  {
+    tickets-purchased: uint,
+    total-spent: uint,
+    first-purchase-time: uint,
+    tier-preferences: (list 10 uint)
+  }
+)
+
 ;; Data maps
 ;; Event data structure
 (define-map events
@@ -163,19 +209,16 @@
     (asserts! (< (get tickets-sold event) (get max-tickets event)) ERR-SOLD-OUT)
     (asserts! (< (get sold tier) (get max-supply tier)) ERR-SOLD-OUT)
     
-    ;; Update ticket tier sold count
     (map-set ticket-tiers
       { event-id: event-id, tier-id: tier-id }
       (merge tier { sold: (+ (get sold tier) u1) })
     )
     
-    ;; Update event tickets sold
     (map-set events
       { event-id: event-id }
       (merge event { tickets-sold: (+ (get tickets-sold event) u1) })
     )
     
-    ;; Create new ticket
     (let ((ticket-id (+ (var-get last-ticket-id) u1)))
       (map-set tickets
         { event-id: event-id, ticket-id: ticket-id }
@@ -188,10 +231,12 @@
         }
       )
       (var-set last-ticket-id ticket-id)
+      (unwrap-panic (update-purchase-analytics event-id tier-id (get price tier)))
       (ok ticket-id)
     )
   )
 )
+
 
 ;; Mark attendance at an event
 (define-public (check-in (event-id uint) (ticket-id uint))
@@ -713,6 +758,214 @@
           min
           price-adjustment
         )
+      )
+    )
+  )
+)
+
+
+
+;; Add this public function to update analytics when tickets are purchased
+(define-public (update-purchase-analytics (event-id uint) (tier-id uint) (price uint))
+  (let (
+    (current-day (/ stacks-block-height u144))
+    (current-analytics (default-to 
+      {
+        total-revenue: u0,
+        peak-sales-day: u0,
+        peak-sales-count: u0,
+        first-sale-time: stacks-block-height,
+        last-sale-time: stacks-block-height,
+        average-sale-price: u0,
+        conversion-rate: u0,
+        views: u0
+      }
+      (map-get? event-analytics { event-id: event-id })))
+    (daily-data (default-to
+      {
+        tickets-sold: u0,
+        revenue: u0,
+        unique-buyers: u0
+      }
+      (map-get? daily-sales { event-id: event-id, day: current-day })))
+    (tier-data (default-to
+      {
+        conversion-rate: u0,
+        average-time-to-sell: u0,
+        revenue: u0,
+        refund-rate: u0
+      }
+      (map-get? tier-performance { event-id: event-id, tier-id: tier-id })))
+    (buyer-data (default-to
+      {
+        tickets-purchased: u0,
+        total-spent: u0,
+        first-purchase-time: stacks-block-height,
+        tier-preferences: (list)
+      }
+      (map-get? buyer-analytics { event-id: event-id, buyer: tx-sender })))
+  )
+    
+    (map-set event-analytics
+      { event-id: event-id }
+      {
+        total-revenue: (+ (get total-revenue current-analytics) price),
+        peak-sales-day: (if (> (+ (get tickets-sold daily-data) u1) (get peak-sales-count current-analytics))
+                           current-day
+                           (get peak-sales-day current-analytics)),
+        peak-sales-count: (if (> (+ (get tickets-sold daily-data) u1) (get peak-sales-count current-analytics))
+                             (+ (get tickets-sold daily-data) u1)
+                             (get peak-sales-count current-analytics)),
+        first-sale-time: (if (is-eq (get total-revenue current-analytics) u0)
+                            stacks-block-height
+                            (get first-sale-time current-analytics)),
+        last-sale-time: stacks-block-height,
+        average-sale-price: (/ (+ (get total-revenue current-analytics) price)
+                              (+ (/ (get total-revenue current-analytics) 
+                                   (if (is-eq (get average-sale-price current-analytics) u0) u1 (get average-sale-price current-analytics))) u1)),
+        conversion-rate: (get conversion-rate current-analytics),
+        views: (get views current-analytics)
+      }
+    )
+    
+    (map-set daily-sales
+      { event-id: event-id, day: current-day }
+      {
+        tickets-sold: (+ (get tickets-sold daily-data) u1),
+        revenue: (+ (get revenue daily-data) price),
+        unique-buyers: (+ (get unique-buyers daily-data) 
+                         (if (is-eq (get tickets-purchased buyer-data) u0) u1 u0))
+      }
+    )
+    
+    (map-set tier-performance
+      { event-id: event-id, tier-id: tier-id }
+      {
+        conversion-rate: (get conversion-rate tier-data),
+        average-time-to-sell: (get average-time-to-sell tier-data),
+        revenue: (+ (get revenue tier-data) price),
+        refund-rate: (get refund-rate tier-data)
+      }
+    )
+    
+    (map-set buyer-analytics
+      { event-id: event-id, buyer: tx-sender }
+      {
+        tickets-purchased: (+ (get tickets-purchased buyer-data) u1),
+        total-spent: (+ (get total-spent buyer-data) price),
+        first-purchase-time: (if (is-eq (get tickets-purchased buyer-data) u0)
+                                stacks-block-height
+                                (get first-purchase-time buyer-data)),
+        tier-preferences: (if (< (len (get tier-preferences buyer-data)) u10)
+                             (unwrap-panic (as-max-len? (append (get tier-preferences buyer-data) tier-id) u10))
+                             (get tier-preferences buyer-data))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (track-event-view (event-id uint))
+  (let ((current-analytics (default-to 
+    {
+      total-revenue: u0,
+      peak-sales-day: u0,
+      peak-sales-count: u0,
+      first-sale-time: u0,
+      last-sale-time: u0,
+      average-sale-price: u0,
+      conversion-rate: u0,
+      views: u0
+    }
+    (map-get? event-analytics { event-id: event-id }))))
+    
+    (map-set event-analytics
+      { event-id: event-id }
+      (merge current-analytics { views: (+ (get views current-analytics) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (calculate-conversion-rate (event-id uint))
+  (let (
+    (analytics (unwrap! (map-get? event-analytics { event-id: event-id }) ERR-ANALYTICS-NOT-FOUND))
+    (event-data (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get organizer event-data)) ERR-NOT-AUTHORIZED)
+    (asserts! (> (get views analytics) u0) ERR-INSUFFICIENT-DATA)
+    
+    (let ((conversion-rate (/ (* (get tickets-sold event-data) u100) (get views analytics))))
+      (map-set event-analytics
+        { event-id: event-id }
+        (merge analytics { conversion-rate: conversion-rate })
+      )
+      (ok conversion-rate)
+    )
+  )
+)
+
+(define-read-only (get-event-analytics (event-id uint))
+  (map-get? event-analytics { event-id: event-id })
+)
+
+(define-read-only (get-daily-sales (event-id uint) (day uint))
+  (map-get? daily-sales { event-id: event-id, day: day })
+)
+
+(define-read-only (get-tier-performance (event-id uint) (tier-id uint))
+  (map-get? tier-performance { event-id: event-id, tier-id: tier-id })
+)
+
+(define-read-only (get-buyer-analytics (event-id uint) (buyer principal))
+  (map-get? buyer-analytics { event-id: event-id, buyer: buyer })
+)
+
+(define-read-only (get-sales-velocity (event-id uint))
+  (let ((analytics (unwrap! (map-get? event-analytics { event-id: event-id }) ERR-ANALYTICS-NOT-FOUND)))
+    (if (is-eq (get first-sale-time analytics) (get last-sale-time analytics))
+      (ok u0)
+      (let (
+        (time-diff (- (get last-sale-time analytics) (get first-sale-time analytics)))
+        (event-data (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND))
+      )
+        (ok (/ (get tickets-sold event-data) time-diff))
+      )
+    )
+  )
+)
+
+(define-read-only (get-revenue-by-tier (event-id uint))
+  (let ((event-data (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND)))
+    (ok (list 
+      (default-to { conversion-rate: u0, average-time-to-sell: u0, revenue: u0, refund-rate: u0 }
+                  (map-get? tier-performance { event-id: event-id, tier-id: u1 }))
+      (default-to { conversion-rate: u0, average-time-to-sell: u0, revenue: u0, refund-rate: u0 }
+                  (map-get? tier-performance { event-id: event-id, tier-id: u2 }))
+      (default-to { conversion-rate: u0, average-time-to-sell: u0, revenue: u0, refund-rate: u0 }
+                  (map-get? tier-performance { event-id: event-id, tier-id: u3 }))
+    ))
+  )
+)
+
+(define-read-only (get-top-buyers (event-id uint))
+  (ok "Analytics data available via get-buyer-analytics function")
+)
+
+(define-read-only (get-sales-forecast (event-id uint))
+  (let (
+    (analytics (unwrap! (map-get? event-analytics { event-id: event-id }) ERR-ANALYTICS-NOT-FOUND))
+    (event-data (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND))
+  )
+    (if (is-eq (get tickets-sold event-data) u0)
+      (ok u0)
+      (let (
+        (current-velocity (unwrap-panic (get-sales-velocity event-id)))
+        (remaining-tickets (- (get max-tickets event-data) (get tickets-sold event-data)))
+      )
+        (ok (if (> current-velocity u0)
+              (/ remaining-tickets current-velocity)
+              u0))
       )
     )
   )
