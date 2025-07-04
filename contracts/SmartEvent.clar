@@ -17,6 +17,9 @@
 
 (define-constant ERR-ANALYTICS-NOT-FOUND (err u120))
 (define-constant ERR-INSUFFICIENT-DATA (err u121))
+(define-constant ERR-SUBSCRIPTION-NOT-FOUND (err u122))
+(define-constant ERR-SUBSCRIPTION-EXPIRED (err u123))
+(define-constant ERR-SUBSCRIPTION-ALREADY-EXISTS (err u124))
 
 (define-map event-analytics
   { event-id: uint }
@@ -112,6 +115,41 @@
 ;; Data vars
 (define-data-var last-event-id uint u0)
 (define-data-var last-ticket-id uint u0)
+(define-data-var last-subscription-id uint u0)
+
+(define-map subscriptions
+  { subscription-id: uint }
+  {
+    owner: principal,
+    tier: (string-ascii 20),
+    expires-at: uint,
+    events-included: uint,
+    events-used: uint,
+    price: uint,
+    auto-renew: bool,
+    active: bool
+  }
+)
+
+(define-map user-subscriptions
+  { user: principal }
+  { subscription-id: uint }
+)
+
+(define-map subscription-tiers
+  { tier-name: (string-ascii 20) }
+  {
+    events-per-period: uint,
+    period-duration: uint,
+    price: uint,
+    benefits: (string-ascii 200)
+  }
+)
+
+(define-map subscription-event-access
+  { subscription-id: uint, event-id: uint }
+  { used: bool }
+)
 
 ;; Public functions
 
@@ -967,6 +1005,126 @@
               (/ remaining-tickets current-velocity)
               u0))
       )
+    )
+  )
+)
+
+(define-public (subscribe
+    (tier-name (string-ascii 20))
+    (auto-renew bool))
+  (let (
+    (tier (unwrap! (map-get? subscription-tiers { tier-name: tier-name }) ERR-SUBSCRIPTION-NOT-FOUND))
+    (existing-sub (map-get? user-subscriptions { user: tx-sender }))
+    (subscription-id (+ (var-get last-subscription-id) u1))
+  )
+    (asserts! (is-none existing-sub) ERR-SUBSCRIPTION-ALREADY-EXISTS)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      {
+        owner: tx-sender,
+        tier: tier-name,
+        expires-at: (+ stacks-block-height (get period-duration tier)),
+        events-included: (get events-per-period tier),
+        events-used: u0,
+        price: (get price tier),
+        auto-renew: auto-renew,
+        active: true
+      }
+    )
+    
+    (map-set user-subscriptions
+      { user: tx-sender }
+      { subscription-id: subscription-id }
+    )
+    
+    (var-set last-subscription-id subscription-id)
+    (ok subscription-id)
+  )
+)
+
+(define-public (use-subscription-for-event (event-id uint))
+  (let (
+    (user-sub (unwrap! (map-get? user-subscriptions { user: tx-sender }) ERR-SUBSCRIPTION-NOT-FOUND))
+    (subscription (unwrap! (map-get? subscriptions { subscription-id: (get subscription-id user-sub) }) ERR-SUBSCRIPTION-NOT-FOUND))
+  )
+    (asserts! (get active subscription) ERR-SUBSCRIPTION-EXPIRED)
+    (asserts! (< stacks-block-height (get expires-at subscription)) ERR-SUBSCRIPTION-EXPIRED)
+    (asserts! (< (get events-used subscription) (get events-included subscription)) ERR-SUBSCRIPTION-EXPIRED)
+    
+    (map-set subscription-event-access
+      { subscription-id: (get subscription-id user-sub), event-id: event-id }
+      { used: true }
+    )
+    
+    (map-set subscriptions
+      { subscription-id: (get subscription-id user-sub) }
+      (merge subscription { events-used: (+ (get events-used subscription) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (renew-subscription (subscription-id uint))
+  (let (
+    (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR-SUBSCRIPTION-NOT-FOUND))
+    (tier (unwrap! (map-get? subscription-tiers { tier-name: (get tier subscription) }) ERR-SUBSCRIPTION-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get owner subscription)) ERR-NOT-AUTHORIZED)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription {
+        expires-at: (+ stacks-block-height (get period-duration tier)),
+        events-used: u0,
+        active: true
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-subscription (subscription-id uint))
+  (let ((subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR-SUBSCRIPTION-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get owner subscription)) ERR-NOT-AUTHORIZED)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? subscriptions { subscription-id: subscription-id })
+)
+
+(define-read-only (get-user-subscription (user principal))
+  (map-get? user-subscriptions { user: user })
+)
+
+(define-read-only (get-subscription-tier (tier-name (string-ascii 20)))
+  (map-get? subscription-tiers { tier-name: tier-name })
+)
+
+(define-read-only (check-subscription-event-access (subscription-id uint) (event-id uint))
+  (is-some (map-get? subscription-event-access { subscription-id: subscription-id, event-id: event-id }))
+)
+
+(define-read-only (get-subscription-status (user principal))
+  (let ((user-sub (map-get? user-subscriptions { user: user })))
+    (if (is-some user-sub)
+      (let ((subscription (unwrap-panic (map-get? subscriptions { subscription-id: (get subscription-id (unwrap-panic user-sub)) }))))
+        (ok {
+          active: (get active subscription),
+          expires-at: (get expires-at subscription),
+          events-remaining: (- (get events-included subscription) (get events-used subscription)),
+          tier: (get tier subscription)
+        })
+      )
+      (ok { active: false, expires-at: u0, events-remaining: u0, tier: "" })
     )
   )
 )
