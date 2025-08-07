@@ -21,6 +21,16 @@
 (define-constant ERR-SUBSCRIPTION-EXPIRED (err u123))
 (define-constant ERR-SUBSCRIPTION-ALREADY-EXISTS (err u124))
 
+;; Revenue Sharing Error Constants
+(define-constant ERR-REVENUE-SHARE-NOT-FOUND (err u200))
+(define-constant ERR-INVALID-PERCENTAGE (err u201))
+(define-constant ERR-STAKEHOLDER-ALREADY-EXISTS (err u202))
+(define-constant ERR-STAKEHOLDER-NOT-FOUND (err u203))
+(define-constant ERR-INSUFFICIENT-FUNDS (err u204))
+(define-constant ERR-REVENUE-ALREADY-DISTRIBUTED (err u205))
+(define-constant ERR-INVALID-STAKEHOLDER-COUNT (err u206))
+(define-constant ERR-PERCENTAGE-TOTAL-INVALID (err u207))
+
 (define-map event-analytics
   { event-id: uint }
   {
@@ -116,6 +126,7 @@
 (define-data-var last-event-id uint u0)
 (define-data-var last-ticket-id uint u0)
 (define-data-var last-subscription-id uint u0)
+(define-data-var last-revenue-share-id uint u0)
 
 (define-map subscriptions
   { subscription-id: uint }
@@ -149,6 +160,45 @@
 (define-map subscription-event-access
   { subscription-id: uint, event-id: uint }
   { used: bool }
+)
+
+;; Revenue Sharing Maps
+(define-map revenue-share-agreements
+  { share-id: uint }
+  {
+    event-id: uint,
+    creator: principal,
+    total-stakeholders: uint,
+    total-percentage: uint,
+    revenue-pool: uint,
+    distributed: bool,
+    created-at: uint
+  }
+)
+
+(define-map revenue-stakeholders
+  { share-id: uint, stakeholder: principal }
+  {
+    percentage: uint,
+    role: (string-ascii 50),
+    amount-due: uint,
+    amount-paid: uint,
+    approved: bool
+  }
+)
+
+(define-map event-revenue-shares
+  { event-id: uint }
+  { share-id: uint }
+)
+
+(define-map stakeholder-earnings
+  { stakeholder: principal }
+  {
+    total-earned: uint,
+    total-events: uint,
+    pending-amount: uint
+  }
 )
 
 ;; Public functions
@@ -1128,3 +1178,225 @@
     )
   )
 )
+
+;; Revenue Sharing Functions
+
+;; Create a revenue sharing agreement for an event
+(define-public (create-revenue-share (event-id uint))
+  (let (
+    (event (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND))
+    (share-id (+ (var-get last-revenue-share-id) u1))
+  )
+    (asserts! (is-eq tx-sender (get organizer event)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none (map-get? event-revenue-shares { event-id: event-id })) ERR-STAKEHOLDER-ALREADY-EXISTS)
+    
+    (map-set revenue-share-agreements
+      { share-id: share-id }
+      {
+        event-id: event-id,
+        creator: tx-sender,
+        total-stakeholders: u0,
+        total-percentage: u0,
+        revenue-pool: u0,
+        distributed: false,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set event-revenue-shares
+      { event-id: event-id }
+      { share-id: share-id }
+    )
+    
+    (var-set last-revenue-share-id share-id)
+    (ok share-id)
+  )
+)
+
+;; Add a stakeholder to a revenue sharing agreement
+(define-public (add-stakeholder 
+    (share-id uint) 
+    (stakeholder principal) 
+    (percentage uint) 
+    (role (string-ascii 50)))
+  (let (
+    (agreement (unwrap! (map-get? revenue-share-agreements { share-id: share-id }) ERR-REVENUE-SHARE-NOT-FOUND))
+    (existing-stakeholder (map-get? revenue-stakeholders { share-id: share-id, stakeholder: stakeholder }))
+  )
+    (asserts! (is-eq tx-sender (get creator agreement)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none existing-stakeholder) ERR-STAKEHOLDER-ALREADY-EXISTS)
+    (asserts! (> percentage u0) ERR-INVALID-PERCENTAGE)
+    (asserts! (<= percentage u100) ERR-INVALID-PERCENTAGE)
+    (asserts! (<= (+ (get total-percentage agreement) percentage) u100) ERR-PERCENTAGE-TOTAL-INVALID)
+    (asserts! (not (get distributed agreement)) ERR-REVENUE-ALREADY-DISTRIBUTED)
+    
+    (map-set revenue-stakeholders
+      { share-id: share-id, stakeholder: stakeholder }
+      {
+        percentage: percentage,
+        role: role,
+        amount-due: u0,
+        amount-paid: u0,
+        approved: false
+      }
+    )
+    
+    (map-set revenue-share-agreements
+      { share-id: share-id }
+      (merge agreement {
+        total-stakeholders: (+ (get total-stakeholders agreement) u1),
+        total-percentage: (+ (get total-percentage agreement) percentage)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Approve a stakeholder (must be called by the stakeholder themselves)
+(define-public (approve-stakeholder-participation (share-id uint))
+  (let (
+    (stakeholder-data (unwrap! (map-get? revenue-stakeholders { share-id: share-id, stakeholder: tx-sender }) ERR-STAKEHOLDER-NOT-FOUND))
+    (agreement (unwrap! (map-get? revenue-share-agreements { share-id: share-id }) ERR-REVENUE-SHARE-NOT-FOUND))
+  )
+    (asserts! (not (get distributed agreement)) ERR-REVENUE-ALREADY-DISTRIBUTED)
+    
+    (map-set revenue-stakeholders
+      { share-id: share-id, stakeholder: tx-sender }
+      (merge stakeholder-data { approved: true })
+    )
+    (ok true)
+  )
+)
+
+;; Update revenue pool (called when tickets are sold)
+(define-public (update-revenue-pool (event-id uint) (amount uint))
+  (let (
+    (event (unwrap! (map-get? events { event-id: event-id }) ERR-EVENT-NOT-FOUND))
+    (revenue-share-ref (map-get? event-revenue-shares { event-id: event-id }))
+  )
+    (asserts! (is-eq tx-sender (get organizer event)) ERR-NOT-AUTHORIZED)
+    
+    (if (is-some revenue-share-ref)
+      (let (
+        (share-id (get share-id (unwrap-panic revenue-share-ref)))
+        (agreement (unwrap! (map-get? revenue-share-agreements { share-id: share-id }) ERR-REVENUE-SHARE-NOT-FOUND))
+      )
+        (map-set revenue-share-agreements
+          { share-id: share-id }
+          (merge agreement { revenue-pool: (+ (get revenue-pool agreement) amount) })
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Distribute revenue to all approved stakeholders
+(define-public (distribute-revenue (share-id uint))
+  (let (
+    (agreement (unwrap! (map-get? revenue-share-agreements { share-id: share-id }) ERR-REVENUE-SHARE-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator agreement)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get distributed agreement)) ERR-REVENUE-ALREADY-DISTRIBUTED)
+    (asserts! (> (get revenue-pool agreement) u0) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (is-eq (get total-percentage agreement) u100) ERR-PERCENTAGE-TOTAL-INVALID)
+    
+    ;; Mark as distributed
+    (map-set revenue-share-agreements
+      { share-id: share-id }
+      (merge agreement { distributed: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Calculate and set amount due for a specific stakeholder
+(define-public (calculate-stakeholder-share (share-id uint) (stakeholder principal))
+  (let (
+    (agreement (unwrap! (map-get? revenue-share-agreements { share-id: share-id }) ERR-REVENUE-SHARE-NOT-FOUND))
+    (stakeholder-data (unwrap! (map-get? revenue-stakeholders { share-id: share-id, stakeholder: stakeholder }) ERR-STAKEHOLDER-NOT-FOUND))
+  )
+    (asserts! (get approved stakeholder-data) ERR-NOT-AUTHORIZED)
+    (asserts! (get distributed agreement) ERR-REVENUE-ALREADY-DISTRIBUTED)
+    
+    (let ((amount-due (/ (* (get revenue-pool agreement) (get percentage stakeholder-data)) u100)))
+      (map-set revenue-stakeholders
+        { share-id: share-id, stakeholder: stakeholder }
+        (merge stakeholder-data { amount-due: amount-due })
+      )
+      
+      ;; Update stakeholder earnings tracking
+      (let ((earnings (default-to { total-earned: u0, total-events: u0, pending-amount: u0 }
+                        (map-get? stakeholder-earnings { stakeholder: stakeholder }))))
+        (map-set stakeholder-earnings
+          { stakeholder: stakeholder }
+          {
+            total-earned: (+ (get total-earned earnings) amount-due),
+            total-events: (+ (get total-events earnings) u1),
+            pending-amount: (+ (get pending-amount earnings) amount-due)
+          }
+        )
+      )
+      (ok amount-due)
+    )
+  )
+)
+
+;; Withdraw earnings for a stakeholder
+(define-public (withdraw-earnings (share-id uint))
+  (let (
+    (stakeholder-data (unwrap! (map-get? revenue-stakeholders { share-id: share-id, stakeholder: tx-sender }) ERR-STAKEHOLDER-NOT-FOUND))
+    (agreement (unwrap! (map-get? revenue-share-agreements { share-id: share-id }) ERR-REVENUE-SHARE-NOT-FOUND))
+  )
+    (asserts! (get approved stakeholder-data) ERR-NOT-AUTHORIZED)
+    (asserts! (get distributed agreement) ERR-REVENUE-ALREADY-DISTRIBUTED)
+    (asserts! (> (get amount-due stakeholder-data) u0) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (is-eq (get amount-paid stakeholder-data) u0) ERR-REVENUE-ALREADY-DISTRIBUTED)
+    
+    ;; Mark as paid
+    (map-set revenue-stakeholders
+      { share-id: share-id, stakeholder: tx-sender }
+      (merge stakeholder-data { amount-paid: (get amount-due stakeholder-data) })
+    )
+    
+    ;; Update pending amount in earnings
+    (let ((earnings (default-to { total-earned: u0, total-events: u0, pending-amount: u0 }
+                      (map-get? stakeholder-earnings { stakeholder: tx-sender }))))
+      (map-set stakeholder-earnings
+        { stakeholder: tx-sender }
+        (merge earnings { pending-amount: (- (get pending-amount earnings) (get amount-due stakeholder-data)) })
+      )
+    )
+    
+    (ok (get amount-due stakeholder-data))
+  )
+)
+
+;; Read-only functions for revenue sharing
+
+(define-read-only (get-revenue-share-agreement (share-id uint))
+  (map-get? revenue-share-agreements { share-id: share-id })
+)
+
+(define-read-only (get-stakeholder-info (share-id uint) (stakeholder principal))
+  (map-get? revenue-stakeholders { share-id: share-id, stakeholder: stakeholder })
+)
+
+(define-read-only (get-event-revenue-share (event-id uint))
+  (map-get? event-revenue-shares { event-id: event-id })
+)
+
+(define-read-only (get-stakeholder-earnings (stakeholder principal))
+  (map-get? stakeholder-earnings { stakeholder: stakeholder })
+)
+
+(define-read-only (calculate-revenue-projection (share-id uint) (projected-revenue uint))
+  (let ((agreement (unwrap! (map-get? revenue-share-agreements { share-id: share-id }) ERR-REVENUE-SHARE-NOT-FOUND)))
+    (ok projected-revenue)
+  )
+)
+
+
